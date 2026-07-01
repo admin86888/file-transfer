@@ -9,7 +9,7 @@ import (
 
 func TestECB(t *testing.T) {
 	raw := utils.GenRandBytes(16)
-	key := utils.GenRandBytes(8)
+	key := utils.GenRandBytes(16) // AES requires a 16/24/32-byte key
 	src := encryptAESECB(raw, key)
 	dec := decryptAESECB(src, key)
 	if bytes.Equal(dec, raw) {
@@ -22,7 +22,7 @@ func TestECB(t *testing.T) {
 func TestCBC(t *testing.T) {
 	raw := utils.GenRandBytes(16)
 	iv := utils.GenRandBytes(16)
-	key := utils.GenRandBytes(8)
+	key := utils.GenRandBytes(16) // AES requires a 16/24/32-byte key
 	src := encryptAESCBC(raw, key, iv)
 	dec := decryptAESCBC(src, key, iv)
 	if bytes.Equal(dec, raw) {
