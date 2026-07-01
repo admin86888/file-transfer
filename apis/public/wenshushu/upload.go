@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
@@ -22,7 +23,7 @@ import (
 	"github.com/mr-tron/base58"
 )
 
-const (
+var (
 	anonymous = "https://www.wenshushu.cn/ap/login/anonymous"
 	addSend   = "https://www.wenshushu.cn/ap/task/addsend"
 	getUpID   = "https://www.wenshushu.cn/ap/uploadv2/getupid"
@@ -34,6 +35,29 @@ const (
 	userInfo  = "https://www.wenshushu.cn/ap/user/userinfo"
 	userStor  = "https://www.wenshushu.cn/ap/user/storage"
 )
+
+const (
+	// maxParts is the wenshushu upload part-count cap (10000).
+	maxParts = 10000
+	// maxRetries caps per-part upload retry attempts so a persistent error
+	// terminates instead of re-enqueuing forever (which used to deadlock
+	// when the sole worker turned into a sender on an unbuffered channel).
+	maxRetries = 3
+)
+
+// adjustBlockSize grows the block size so that the file splits into at most
+// maxParts chunks. It uses ceiling division: dividing by 10000 and rounding
+// up guarantees parts <= 10000 even for large files (floor division left
+// 10001 parts for sizes like 10/20 GiB).
+func adjustBlockSize(size int64, defaultBlock int64) int64 {
+	if size <= 0 || defaultBlock <= 0 {
+		return defaultBlock
+	}
+	if size/defaultBlock <= maxParts {
+		return defaultBlock
+	}
+	return int64(math.Ceil(float64(size) / maxParts))
+}
 
 func (b *wssTransfer) InitUpload(_ []string, sizes []int64) error {
 	if b.Config.singleMode {
@@ -65,15 +89,31 @@ func (b *wssTransfer) PreUpload(_ string, size int64) error {
 
 func (b wssTransfer) DoUpload(name string, size int64, file io.Reader) error {
 
-	if size/int64(b.Config.blockSize) > 10000 {
-		b.Config.blockSize = int(size / 10000)
+	if adjusted := adjustBlockSize(size, int64(b.Config.blockSize)); adjusted != int64(b.Config.blockSize) {
+		b.Config.blockSize = int(adjusted)
 		fmt.Printf("blocksize too small, set to %d\n", b.Config.blockSize)
 	}
 
 	wg := new(sync.WaitGroup)
 	ch := make(chan *uploadPart)
+	var (
+		uploadErr error
+		errMu     sync.Mutex
+	)
+	recordErr := func(e error) {
+		errMu.Lock()
+		if uploadErr == nil {
+			uploadErr = e
+		}
+		errMu.Unlock()
+	}
+	firstErr := func() error {
+		errMu.Lock()
+		defer errMu.Unlock()
+		return uploadErr
+	}
 	for i := 0; i < b.Config.Parallel; i++ {
-		go b.uploader(&ch, b.baseConf)
+		go b.uploader(&ch, b.baseConf, wg, recordErr)
 	}
 	part := int64(0)
 	for {
@@ -93,13 +133,17 @@ func (b wssTransfer) DoUpload(name string, size int64, file io.Reader) error {
 				content: buf[:nr],
 				count:   part,
 				name:    name,
-				wg:      wg,
 			}
 		}
 	}
 
 	wg.Wait()
 	close(ch)
+
+	if err := firstErr(); err != nil {
+		return fmt.Errorf("upload aborted, some parts failed: %w", err)
+	}
+
 	// finish upload
 	err := b.finishUpload(b.baseConf, name)
 	if err != nil {
@@ -123,70 +167,86 @@ func (b wssTransfer) FinishUpload([]string) (string, error) {
 	return "", nil
 }
 
-func (b wssTransfer) uploader(ch *chan *uploadPart, config sendConfigBlock) {
+func (b wssTransfer) uploader(ch *chan *uploadPart, config sendConfigBlock, wg *sync.WaitGroup, recordErr func(error)) {
 	for item := range *ch {
-		d, _ := json.Marshal(map[string]any{
-			"ispart": true,
-			"fname":  item.name,
-			"partnu": item.count,
-			"fsize":  b.Config.blockSize,
-			"upId":   config.UploadID,
-		})
-		uploadTicket, err := newRequest(getUpURL, string(d), requestConfig{
-			debug:    apis.DebugMode,
-			retry:    0,
-			timeout:  time.Duration(b.Config.interval) * time.Second,
-			modifier: addToken(config.Token),
-		})
+		// Retry in-place. The worker never re-enqueues into ch, which avoids
+		// the deadlock where the sole worker (or all workers) block sending
+		// while the producer is also blocked sending on the unbuffered channel.
+		err := b.uploadPartWithRetry(item, config)
+		// Record the error BEFORE Done so that when wg.Wait() returns, every
+		// uploader has finished writing uploadErr; the main goroutine can then
+		// read it safely under the same mutex.
 		if err != nil {
-			if apis.DebugMode {
-				log.Printf("get upload url request returns error: %v", err)
-			}
-			*ch <- item
-			continue
+			recordErr(fmt.Errorf("part %d failed after %d retries: %w", item.count, maxRetries, err))
 		}
+		// Always release the WaitGroup counter so the producer never blocks
+		// on wg.Wait() waiting for a part that gave up.
+		wg.Done()
+	}
+}
 
-		client := http.Client{Timeout: time.Duration(b.Config.interval) * time.Second}
-		data := new(bytes.Buffer)
-		data.Write(item.content)
+func (b wssTransfer) uploadPartWithRetry(item *uploadPart, config sendConfigBlock) error {
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// linear backoff between retries
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+		lastErr = b.uploadOnePart(item, config)
+		if lastErr == nil {
+			return nil
+		}
 		if apis.DebugMode {
-			log.Printf("part %d start uploading", item.count)
-			log.Printf("part %d posting %s", item.count, uploadTicket.Data.URL)
+			log.Printf("part %d attempt %d/%d failed: %v", item.count, attempt+1, maxRetries+1, lastErr)
 		}
-		req, err := http.NewRequest("PUT", uploadTicket.Data.URL, data)
-		if err != nil {
-			if apis.DebugMode {
-				log.Printf("build request returns error: %v", err)
-			}
-			*ch <- item
-			continue
-		}
-		req.Header.Set("content-type", "application/octet-stream")
-		resp, err := client.Do(req)
-		if err != nil {
-			if apis.DebugMode {
-				log.Printf("failed uploading part %d error: %v (retrying)", item.count, err)
-			}
-			*ch <- item
-			continue
-		}
-		_, err = ioutil.ReadAll(resp.Body)
-		if err != nil {
-			if apis.DebugMode {
-				log.Printf("failed uploading part %d error: %v (retrying)", item.count, err)
-			}
-			*ch <- item
-			continue
-		}
+	}
+	return lastErr
+}
 
-		_ = resp.Body.Close()
-
-		if apis.DebugMode {
-			log.Printf("part %d finished.", item.count)
-		}
-		item.wg.Done()
+func (b wssTransfer) uploadOnePart(item *uploadPart, config sendConfigBlock) error {
+	d, _ := json.Marshal(map[string]any{
+		"ispart": true,
+		"fname":  item.name,
+		"partnu": item.count,
+		"fsize":  b.Config.blockSize,
+		"upId":   config.UploadID,
+	})
+	uploadTicket, err := newRequest(getUpURL, string(d), requestConfig{
+		debug:    apis.DebugMode,
+		retry:    0,
+		timeout:  time.Duration(b.Config.interval) * time.Second,
+		modifier: addToken(config.Token),
+	})
+	if err != nil {
+		return fmt.Errorf("get upload url: %w", err)
 	}
 
+	client := http.Client{Timeout: time.Duration(b.Config.interval) * time.Second}
+	data := new(bytes.Buffer)
+	data.Write(item.content)
+	if apis.DebugMode {
+		log.Printf("part %d start uploading", item.count)
+		log.Printf("part %d posting %s", item.count, uploadTicket.Data.URL)
+	}
+	req, err := http.NewRequest("PUT", uploadTicket.Data.URL, data)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("content-type", "application/octet-stream")
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("put part: %w", err)
+	}
+	_, err = ioutil.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+
+	if apis.DebugMode {
+		log.Printf("part %d finished.", item.count)
+	}
+	return nil
 }
 
 func (b wssTransfer) finishUpload(config sendConfigBlock, name string) error {

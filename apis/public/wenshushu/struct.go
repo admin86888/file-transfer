@@ -2,7 +2,6 @@ package wenshushu
 
 import (
 	"net/http"
-	"sync"
 	"time"
 )
 
@@ -26,7 +25,6 @@ type uploadPart struct {
 	content []byte
 	count   int64
 	name    string
-	wg      *sync.WaitGroup
 }
 
 type sendConfigResp struct {
